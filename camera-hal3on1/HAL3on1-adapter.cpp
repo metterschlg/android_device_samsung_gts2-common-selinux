@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024-2025 acroreiser
+ * Copyright (C) 2024 acroreiser
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <android/native_window.h>
 #include <hardware/hardware.h>
 #include <hardware/camera3.h>
 #include <hardware/camera.h>
@@ -24,10 +23,8 @@
 #include <cutils/properties.h>
 #include <ui/Fence.h>
 #include <ui/GraphicBufferMapper.h>
-#include "../include/hardware/gralloc.h"
 #include <utils/Mutex.h>
 #include <linux/errno.h>
-#include <ctime>
 
 #define MAX_SIZES_CNT 40
 #define NSEC_PER_33MSEC 33000000LL
@@ -54,10 +51,6 @@ typedef struct {
 
     int stream_width;
     int stream_height;
-
-    int preview_really_started;
-    int wait_for_raw;
-    preview_stream_ops* preview_window;
 } adapter_camera3_device_t;
 
 #define HAL1_CALL(hal1_device, func, ...) ({ \
@@ -68,9 +61,7 @@ typedef struct {
     bool use_memfd;
     bool use_limited_level;
     bool use_sysfs_torch;
-    bool use_preview_window_stub;
-    bool use_hwcomposer;
-    bool use_msm8916_raw;
+    bool use_manual_exposure;
 } adapter_config_t;
 
 struct CameraMemory {
@@ -92,14 +83,11 @@ adapter_config_t properties = {
     .use_memfd = false,
     .use_limited_level = false,
     .use_sysfs_torch = false,
-    .use_preview_window_stub = false,
-    .use_hwcomposer = false,
-    .use_msm8916_raw = false,
+    .use_manual_exposure = false,
 };
 
 // Put your sysfs path here or use HAL1 torch mode
 #define SYSFS_FLASH_PATH_BRIGHTNESS "/sys/class/leds/torch-light0/brightness"
-#define SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK "/sys/class/leds/torch-light/brightness"
 
 static CameraMetadata static_metadata[2];
 static CameraParameters default_parameters[2];
@@ -150,46 +138,17 @@ void hal1_data_callback(int32_t msg_type,
         memcpy(adapter->buffer, data->data, data->size);
         adapter->buffer_size = data->size;
 
-        if(adapter->preview_really_started == 0)
-            adapter->preview_really_started = 1;
-
         break;
 
     case CAMERA_MSG_COMPRESSED_IMAGE:
-        if (adapter->wait_for_raw != 1) {
-            adapter->jpeg = (uint8_t*)data->data;
-            adapter->jpeg_size = data->size;
+        memcpy(adapter->jpeg, data->data, data->size);
+        adapter->jpeg_size = data->size;
 
-            while (adapter->jpeg_size != 0) { usleep(100); }
-
-            HAL1_CALL(adapter->hal1_device, stop_preview);
-            HAL1_CALL(adapter->hal1_device, start_preview);
-            adapter->preview_really_started = 0;
-
-            break;
-        } else {
-            char filename[128];
-            time_t now = time(NULL);
-            /* It's an experimental feature so user must know what he is doing */
-            strftime(filename, sizeof(filename), "/data/misc/cameraserver/frame_%Y-%m-%d_%H-%M-%S.raw", localtime(&now));
-
-            ALOGI("HAL3on1: dumping Bayer RAW image from sensor (bayer-qcom-10bggr) to %s\n", filename);
-
-            int file_fd = open(filename, O_RDWR | O_CREAT, 0644);
-            if (file_fd >= 0) {
-                ssize_t written_len = write(file_fd, data->data, data->size);
-                ALOGI("HAL3on1: written number of bytes %ld\n", (long)written_len);
-                close(file_fd);
-            } else
-                ALOGE("HAL3on1: failed to open file to dump image: %s\n", strerror(errno));
-
-            HAL1_CALL(adapter->hal1_device, stop_preview);
-            HAL1_CALL(adapter->hal1_device, start_preview);
-            adapter->preview_really_started = 0;
-            adapter->wait_for_raw = 0;
-
-            break;
+        while (adapter->jpeg_size != 0) {
+            usleep(100);
         }
+
+        break;
     }
 }
 
@@ -352,19 +311,7 @@ static int camera3_initialize(const struct camera3_device *dev,
     return NO_ERROR;
 }
 
-/*
- * Some HAL1 implementations require preview window to display (and call back)
- * preview frames even in no-display mode.
- */
-struct preview_stream_ops* preview_window_stub_create() {
-    struct preview_stream_ops* window = (preview_stream_ops*)malloc(sizeof(preview_stream_ops));
-    hal3on1_dev->preview_window = window;
-
-    return window;
-}
-
 static CameraParameters current_params;
-static CameraParameters default_params;
 
 static int camera3_configure_streams(const struct camera3_device *dev, camera3_stream_configuration_t* stream_config)
 {
@@ -379,9 +326,6 @@ static int camera3_configure_streams(const struct camera3_device *dev, camera3_s
     char *settings = HAL1_CALL(hal1_device, get_parameters);
     CameraParameters preview_params;
     preview_params.unflatten(String8(settings));
-
-    // Save default camera parameters to use for RAW dump
-    default_params.unflatten(String8(settings));
 
     ALOGI("----------------------------");
     ALOGI("| Configuring streams:");
@@ -404,6 +348,8 @@ static int camera3_configure_streams(const struct camera3_device *dev, camera3_s
             switch (stream->format) {
 
             case HAL_PIXEL_FORMAT_BLOB:
+                adapter->jpeg = (uint8_t*)malloc((stream->width * stream->height)*2);
+
                 preview_params.set("picture-format", "jpeg");
                 preview_params.setPictureSize(stream->width, stream->height);
                 break;
@@ -433,11 +379,6 @@ static int camera3_configure_streams(const struct camera3_device *dev, camera3_s
                 if (stream->usage == 0x00010000)
                     stream->format = 0x102;
 
-                if (properties.use_hwcomposer)
-                    stream->usage = GRALLOC_USAGE_HW_COMPOSER;
-                else
-                    stream->usage = GRALLOC_USAGE_SW_WRITE_OFTEN;
-
                 break;
             }
         }
@@ -446,11 +387,43 @@ static int camera3_configure_streams(const struct camera3_device *dev, camera3_s
     adapter->buffer_size = adapter->stream_width * adapter->stream_height * 3 / 2;  // For YUV420
     adapter->buffer = (uint8_t*)malloc(adapter->buffer_size);
 
-    ALOGI("----------------------------");
+    ALOGE("----------------------------");
 
     HAL1_CALL(hal1_device, store_meta_data_in_buffers, 0);
 
-    preview_params.set("no-display-mode", "1");
+    preview_params.set("preview-fps-range", "12000,30000");
+    preview_params.set("preview-frame-rate", "30");
+    preview_params.set("preview-format", "yuv420sp");
+    preview_params.set("preview-flip", "off");
+    preview_params.set("video-frame-format", "yuv420sp");
+    preview_params.set("video-hfr", "off");
+    preview_params.set("video-hsr", "off");
+    preview_params.set("video-flip", "off");
+    preview_params.set("selectable-zone-af", "auto");
+    preview_params.set("video-size", "1920x1080");
+    preview_params.set("auto-exposure", "center-weighted");
+    preview_params.set("exposure-mode", "auto");
+    preview_params.set("whitebalance", "auto");
+    preview_params.set("scene-mode", "auto");
+    preview_params.set("scene-detect", "off");
+    preview_params.set("focus-mode", "auto");
+    preview_params.set("auto-exposure-lock", "false");
+    preview_params.set("auto-whitebalance-lock", "false");
+    preview_params.set("flash-mode", "off");
+    preview_params.set("antibanding", "auto");
+    preview_params.set("zsl", "on");
+    preview_params.set("long-shot", "off");
+    preview_params.set("face-detection", "off");
+    preview_params.set("denoise", "denoise-off");
+    preview_params.set("effect", "none");
+    preview_params.set("zoom", "0");
+    preview_params.set("lensshade", "enable");
+    preview_params.set("exposure-compensation", "0");
+    preview_params.set("jpeg-quality", "95");
+    preview_params.set("jpeg-thumbnail-height", "288");
+    preview_params.set("jpeg-thumbnail-width", "512");
+    preview_params.set("jpeg-thumbnail-quality", "85");
+    preview_params.set("iso", "auto");
 
     HAL1_CALL(hal1_device, set_parameters, preview_params.flatten());
     current_params = preview_params;
@@ -464,15 +437,14 @@ static int camera3_configure_streams(const struct camera3_device *dev, camera3_s
     /*
      * Some HAL1 implementations require ANativeWindow to display (and call back)
      * preview frames.
-     * We have a stub for such implementations.
+     * TODO: implement fake preview window for such implementations.
+     *
+     * HAL1_CALL(hal1_device, set_preview_window, (struct preview_stream_ops *)????);
+     *
+     * On QCamera2 HAL1: add persist.camera.no-display=1 property to build.prop.
      */
-    if (properties.use_preview_window_stub)
-        HAL1_CALL(hal1_device, set_preview_window, preview_window_stub_create());
 
     HAL1_CALL(hal1_device, start_preview);
-
-    adapter->preview_really_started = 0;
-    adapter->wait_for_raw = 0;
 
     return NO_ERROR;
 }
@@ -718,7 +690,6 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
     uint8_t ae_mode = ANDROID_CONTROL_AE_MODE_ON;
     bool use_scene = false;
     bool manual_focus = false;
-    bool dump_raw = false;
     status_t e;
 
     if (!request || request->num_output_buffers == 0 || !request->output_buffers) {
@@ -726,32 +697,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         return -EINVAL;
     }
 
-    if (cm.exists(ANDROID_JPEG_QUALITY)) {
-        int32_t jpeg_quality = cm.find(ANDROID_JPEG_QUALITY).data.u8[0];
-
-        /*
-         * We cannot use RAW directly via Camera2 API.
-         * ANDROID_JPEG_QUALITY == 75 will signal HAL to dump bayer RAW
-         * Most people want highest possible quality so no real reason to use 75% quality
-         * excepting special cases. We just adding such case here: to get a bayer raw snapshot!
-         * Additionally 75% is available option in most camera apps where jpeg quality setting is present.
-         *
-         * When jpeg_quality == 75 HAL will reset current CameraParameters and
-         * skip JPEG and post-processing parameters. 
-         */
-
-        if (jpeg_quality == 75 && properties.use_msm8916_raw) {
-            dump_raw = true;
-            previous_params = current_params;
-            current_params = default_params;
-        } else {
-            char jpeg_quality_str[4];
-            sprintf(jpeg_quality_str, "%u", jpeg_quality);
-            current_params.set("jpeg-quality", jpeg_quality_str);
-        }
-    }
-
-    if (!dump_raw && cm.exists(ANDROID_CONTROL_MODE)) {
+    if (cm.exists(ANDROID_CONTROL_MODE)) {
         switch (cm.find(ANDROID_CONTROL_MODE).data.u8[0]) {
 
         case ANDROID_CONTROL_MODE_USE_SCENE_MODE:
@@ -773,7 +719,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         }
     }
 
-    if (!dump_raw && cm.exists(ANDROID_CONTROL_SCENE_MODE) && use_scene) {
+    if (cm.exists(ANDROID_CONTROL_SCENE_MODE) && use_scene) {
         uint8_t scene_mode = cm.find(ANDROID_CONTROL_SCENE_MODE).data.u8[0];
         char scene_mode_str[32];
 
@@ -888,7 +834,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         current_params.set("exposure-compensation", exposure_compensation_str);
     }
 
-    if (!dump_raw && cm.exists(ANDROID_CONTROL_AWB_MODE) && !use_scene) {
+    if (cm.exists(ANDROID_CONTROL_AWB_MODE) && !use_scene) {
         uint8_t awb_mode = cm.find(ANDROID_CONTROL_AWB_MODE).data.u8[0];
         char awb_mode_str[32];
 
@@ -952,7 +898,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         current_params.set("focus-mode", af_mode_str);
     }
 
-    if (!dump_raw && cm.exists(ANDROID_CONTROL_EFFECT_MODE)) {
+    if (cm.exists(ANDROID_CONTROL_EFFECT_MODE)) {
         uint8_t effect_mode = cm.find(ANDROID_CONTROL_EFFECT_MODE).data.u8[0];
         char effect_mode_str[32];
 
@@ -1015,7 +961,8 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
 
         char exposure_time_str[20];
 
-        if (cm.exists(ANDROID_SENSOR_EXPOSURE_TIME)) {
+        if (properties.use_manual_exposure == true &&
+            cm.exists(ANDROID_SENSOR_EXPOSURE_TIME)) {
             int64_t exposure_time = cm.find(ANDROID_SENSOR_EXPOSURE_TIME).data.i64[0];
             int64_t exposure_time_min = static_metadata[current_camera_id].find(ANDROID_SENSOR_INFO_EXPOSURE_TIME_RANGE).data.i64[0];
             int64_t exposure_time_max = static_metadata[current_camera_id].find(ANDROID_SENSOR_INFO_EXPOSURE_TIME_RANGE).data.i64[1];
@@ -1055,7 +1002,8 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         current_params.set("iso", iso_str);
         HAL1_CALL(hal1_device, set_parameters, current_params.flatten());
 
-        if (cm.exists(ANDROID_SENSOR_EXPOSURE_TIME)) {
+        if (properties.use_manual_exposure == true &&
+            cm.exists(ANDROID_SENSOR_EXPOSURE_TIME)) {
             current_params.set("zsl", "off");
             HAL1_CALL(hal1_device, set_parameters, current_params.flatten());
 
@@ -1146,7 +1094,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
             current_params.set("auto-whitebalance-lock", "false");
     }
 
-    if (!dump_raw && cm.exists(ANDROID_NOISE_REDUCTION_MODE)) {
+    if (cm.exists(ANDROID_NOISE_REDUCTION_MODE)) {
         uint8_t noise_reduction = cm.find(ANDROID_NOISE_REDUCTION_MODE).data.u8[0];
 
         if (noise_reduction == ANDROID_NOISE_REDUCTION_MODE_FAST)
@@ -1163,7 +1111,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
             current_params.set("lensshade", "disable");
     }
 
-    if (!dump_raw && cm.exists(ANDROID_JPEG_THUMBNAIL_SIZE)) {
+    if (cm.exists(ANDROID_JPEG_THUMBNAIL_SIZE)) {
         int32_t* jpeg_thumbnail_size = cm.find(ANDROID_JPEG_THUMBNAIL_SIZE).data.i32;
         char jpeg_thumbnail_size_str[2][5];
         sprintf(jpeg_thumbnail_size_str[0], "%u", jpeg_thumbnail_size[0]);
@@ -1172,18 +1120,18 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         current_params.set("jpeg-thumbnail-height", jpeg_thumbnail_size_str[1]);
     }
 
-    if (!dump_raw && cm.exists(ANDROID_JPEG_THUMBNAIL_QUALITY)) {
+    if (cm.exists(ANDROID_JPEG_THUMBNAIL_QUALITY)) {
         int32_t jpeg_thumbnail_quality = cm.find(ANDROID_JPEG_THUMBNAIL_QUALITY).data.u8[0];
         char jpeg_thumbnail_quality_str[4];
         sprintf(jpeg_thumbnail_quality_str, "%u", jpeg_thumbnail_quality);
         current_params.set("jpeg-thumbnail-quality", jpeg_thumbnail_quality_str);
     }
 
-    if (!dump_raw && cm.exists(ANDROID_JPEG_ORIENTATION)) {
-        int32_t orientation = cm.find(ANDROID_JPEG_ORIENTATION).data.i32[0];
-        char orientation_str[4];
-        sprintf(orientation_str, "%u", orientation);
-        current_params.set("rotation", orientation_str);
+    if (cm.exists(ANDROID_JPEG_QUALITY)) {
+        int32_t jpeg_quality = cm.find(ANDROID_JPEG_QUALITY).data.u8[0];
+        char jpeg_quality_str[4];
+        sprintf(jpeg_quality_str, "%u", jpeg_quality);
+        current_params.set("jpeg-quality", jpeg_quality_str);
     }
 
     if (cm.exists(ANDROID_LENS_FOCUS_DISTANCE) &&
@@ -1216,26 +1164,7 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         capture_intent = cm.find(ANDROID_CONTROL_CAPTURE_INTENT).data.u8[0];
 
         if (capture_intent == CAMERA3_TEMPLATE_STILL_CAPTURE) {
-           HAL1_CALL(hal1_device, enable_msg_type, CAMERA_MSG_COMPRESSED_IMAGE);
-
-           if (dump_raw) {
-                /* See ../QCamera2/HAL/QCameraParameters.cpp at line 204 for possible formats. */
-                current_params.set("picture-format", "bayer-qcom-10bggr");
-                current_params.set("zsl", "off"); // HAL1 refuses to take bayer snapshot when ZSL is on.
-                HAL1_CALL(hal1_device, set_parameters, current_params.flatten());
-
-                HAL1_CALL(hal1_device, take_picture);
-
-                // Wait for dump
-                adapter->wait_for_raw = 1;
-                while (adapter->wait_for_raw == 1) { usleep(100); }
-
-                /* Reset to JPEG and take a second snapshot to feed a camera app */
-                current_params.set("picture-format", "jpeg");
-                current_params.set("zsl", "on");
-                HAL1_CALL(hal1_device, set_parameters, current_params.flatten());
-                current_params = previous_params;
-            }
+            HAL1_CALL(hal1_device, enable_msg_type, CAMERA_MSG_COMPRESSED_IMAGE);
             HAL1_CALL(hal1_device, take_picture);
         }
     }
@@ -1257,14 +1186,8 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
         }
 
         uint8_t *buf = NULL;
-        int usage = GRALLOC_USAGE_SW_WRITE_OFTEN;
 
-        if ((output_buffer.stream->format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED ||
-            output_buffer.stream->format == HAL_PIXEL_FORMAT_YCrCb_420_SP) &&
-            properties.use_hwcomposer)
-            usage = GRALLOC_USAGE_HW_COMPOSER;
-
-        GraphicBufferMapper::get().lock(*output_buffer.buffer, usage, rect, (void **)&buf);
+        GraphicBufferMapper::get().lock(*output_buffer.buffer, GRALLOC_USAGE_SW_WRITE_OFTEN, rect, (void **)&buf);
 
         buffers.setCapacity(request->num_output_buffers);
 
@@ -1275,18 +1198,13 @@ static int camera3_process_capture_request(const camera3_device_t* device, camer
 
             memcpy(buf, adapter->jpeg, adapter->jpeg_size);
 
-            camera3_jpeg_blob jpegBlob;
-            jpegBlob.jpeg_blob_id  = CAMERA3_JPEG_BLOB_ID;
-            jpegBlob.jpeg_size     = (uint32_t)adapter->jpeg_size;
+            camera3_jpeg_blob *jpegBlob = reinterpret_cast<camera3_jpeg_blob*>(buf + sizeof(camera3_jpeg_blob));
+            jpegBlob->jpeg_blob_id  = CAMERA3_JPEG_BLOB_ID;
+            jpegBlob->jpeg_size     = (uint32_t)adapter->jpeg_size;
             adapter->jpeg_size = 0;
-
-            memcpy(buf + ((private_handle_t*)(*output_buffer.buffer))->width - sizeof(camera3_jpeg_blob_t), &jpegBlob, sizeof(camera3_jpeg_blob_t));
 
             HAL1_CALL(hal1_device, disable_msg_type, CAMERA_MSG_COMPRESSED_IMAGE);
         } else {
-            while (adapter->preview_really_started == 0)
-            { usleep(100); }
-
             // Crop yuv buffer for streams smaller than preview
             int crop_x, crop_y;
             yuv420sp_buffer *crop_buf = NULL;
@@ -1363,7 +1281,6 @@ static int camera3_flush(const struct camera3_device *dev)
 {
     HAL1_CALL(hal3on1_dev->hal1_device, cancel_picture);
     HAL1_CALL(hal3on1_dev->hal1_device, stop_preview);
-    free(hal3on1_dev->preview_window);
 
     return NO_ERROR;
 }
@@ -1393,15 +1310,12 @@ static int camera_device_open(const hw_module_t *module, const char *id, hw_devi
 
         fd_brightness = open(SYSFS_FLASH_PATH_BRIGHTNESS, O_RDWR);
         if (fd_brightness < 0)
-            fd_brightness = open(SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK, O_RDWR);
-
-        if (fd_brightness < 0)
-            ALOGW("%s: failed to open '%s' and '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS, SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK);
+            ALOGW("%s: failed to open '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
         else {
             int bytes = snprintf(buffer, sizeof(buffer), "0");
             int ret = write(fd_brightness, buffer, (size_t)bytes);
             if (ret <= 0)
-                ALOGW("%s: failed to write to torch sysfs node\n", __FUNCTION__);
+                ALOGW("%s: failed to write to '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
             close(fd_brightness);
         }
     } else if (torch_in_use) {
@@ -1414,22 +1328,11 @@ static int camera_device_open(const hw_module_t *module, const char *id, hw_devi
     }
 
     camera_device_t *hal1_device;
-
-    int ret = -EINVAL;
-    bool open_legacy = false;
-
-    if (hal1_module->common.module_api_version == CAMERA_MODULE_API_VERSION_1_0)
-        ret = hal1_module->common.methods->open(&hal1_module->common, id, (hw_device_t **)&hal1_device);
-    else if(hal1_module->common.module_api_version >= CAMERA_MODULE_API_VERSION_2_3) {
-        ret = hal1_module->open_legacy(&hal1_module->common, id, CAMERA_MODULE_API_VERSION_1_0, (hw_device_t **)&hal1_device);
-        open_legacy = true;
-    }
+    int ret = hal1_module->common.methods->open(&hal1_module->common, id, (hw_device_t **)&hal1_device);
     if (ret != 0) {
         ALOGE("Failed to open HAL1 device");
         return ret;
     }
-
-    ALOGI("HAL3on1: Using %s (%s) with ->%s method as HAL1 backend", hal1_module->common.name, hal1_module->common.author, open_legacy ? "open_legacy" : "common.methods->open");
 
     adapter_camera3_device_t *adapter = (adapter_camera3_device_t *)malloc(sizeof(adapter_camera3_device_t));
     if (!adapter) {
@@ -1541,8 +1444,6 @@ static void camera_convert_parameters(int camera_id, const char *settings, Camer
     uint8_t avail_af_modes[6];
 
     while (token != NULL) {
-        avail_af_modes[fm_counter] = 255;
-
         if (!strcmp(token, "auto"))
             avail_af_modes[fm_counter] = ANDROID_CONTROL_AF_MODE_AUTO;
         if (!strcmp(token, "macro"))
@@ -1558,33 +1459,31 @@ static void camera_convert_parameters(int camera_id, const char *settings, Camer
 
             static const float min_focus_distance = 10.0;
             metadata->update(ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE, &min_focus_distance, 1);
-
-            const char* manual_focus_modes = params.get("manual-focus-modes");
-            uint8_t focus_distance_calibration;
-
-            if (manual_focus_modes)
-                focus_distance_calibration = ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION_CALIBRATED;
-
-            metadata->update(ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION, &focus_distance_calibration,
-                             1);
-
-            float focus_range[2] = { 10.0f, 0.1f };
-            metadata->update(ANDROID_LENS_FOCUS_RANGE, focus_range,
-                             2);
         }
 
-        if (avail_af_modes[fm_counter] == 255) {
-            if (fm_counter == 0)
-                goto noaf;
-        } else
+        if (avail_af_modes[fm_counter])
             fm_counter++;
 
         token = strtok(NULL, ",");
     }
 
+    avail_af_modes[fm_counter] = ANDROID_CONTROL_AF_MODE_OFF;
+    fm_counter++;
+
     metadata->update(ANDROID_CONTROL_AF_AVAILABLE_MODES, avail_af_modes, fm_counter);
 
-noaf:
+    const char* manual_focus_modes = params.get("manual-focus-modes");
+    uint8_t focus_distance_calibration;
+
+    if (manual_focus_modes)
+        focus_distance_calibration = ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION_CALIBRATED;
+
+    metadata->update(ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION, &focus_distance_calibration,
+                     1);
+
+    float focus_range[2] = { 10.0f, 0.1f };
+    metadata->update(ANDROID_LENS_FOCUS_RANGE, focus_range,
+                     2);
 
     const char* wb_values = params.get("whitebalance-values");
     char wb_modes[128];
@@ -1931,6 +1830,46 @@ noaf:
                      available_stall_durations,
                      idx);
 
+    int32_t sensitivity_range[2];
+
+    const char* min_iso_str = params.get("min-iso");
+    if (min_iso_str)
+        sensitivity_range[0] = atoi(min_iso_str);
+    else
+        sensitivity_range[0] = 0;
+
+    const char* max_iso_str = params.get("max-iso");
+    if (max_iso_str)
+        sensitivity_range[1] = atoi(max_iso_str);
+    else
+        sensitivity_range[1] = 0;
+
+    metadata->update(ANDROID_SENSOR_INFO_SENSITIVITY_RANGE, sensitivity_range,
+                     sizeof(sensitivity_range) / sizeof(int32_t));
+
+    int64_t exposure_time_range[2];
+
+    if (properties.use_manual_exposure == true)
+    {
+        const char* min_exposure_time_str = params.get("min-exposure-time");
+        if (min_exposure_time_str)
+            exposure_time_range[0] = (int64_t)(atof(min_exposure_time_str) * 1000000.0);
+        else
+            exposure_time_range[0] = 0;
+
+        const char* max_exposure_time_str = params.get("max-exposure-time");
+        if (max_exposure_time_str)
+            exposure_time_range[1] = (int64_t)(atof(max_exposure_time_str) * 1000000.0);
+        else
+            exposure_time_range[1] = 0;
+    } else {
+        exposure_time_range[0] = 0;
+        exposure_time_range[1] = 0;
+    }
+
+    metadata->update(ANDROID_SENSOR_INFO_EXPOSURE_TIME_RANGE, exposure_time_range,
+                     sizeof(exposure_time_range) / sizeof(int64_t));
+
     const char* flash_mode = params.get("flash-mode-values");
 
     uint8_t flash_available;
@@ -1948,69 +1887,7 @@ noaf:
 
     Vector<uint8_t> avail_ae_modes;
     avail_ae_modes.add(ANDROID_CONTROL_AE_MODE_ON);
-
-    const char* manual_exposure_values = params.get("manual-exposure-modes");
-    char manual_exposure_modes[256];
-
-    if (manual_exposure_values) {
-        bool supported = false;
-        strcpy(manual_exposure_modes, manual_exposure_values);
-
-        token = strtok(manual_exposure_modes, ",");
-
-        while (token != NULL) {
-            if (!strcmp(token, "exp-time-priority")) {
-                int64_t exposure_time_range[2];
-
-                const char* min_exposure_time_str = params.get("min-exposure-time");
-                if (min_exposure_time_str)
-                    exposure_time_range[0] = (int64_t)(atof(min_exposure_time_str) * 1000000.0);
-                else
-                    exposure_time_range[0] = 0;
-
-                const char* max_exposure_time_str = params.get("max-exposure-time");
-                if (max_exposure_time_str)
-                    exposure_time_range[1] = (int64_t)(atof(max_exposure_time_str) * 1000000.0);
-                else
-                    exposure_time_range[1] = 0;
-
-                metadata->update(ANDROID_SENSOR_INFO_EXPOSURE_TIME_RANGE, exposure_time_range,
-                                 sizeof(exposure_time_range) / sizeof(int64_t));
-
-                if (exposure_time_range[1] > exposure_time_range[0])
-                    supported = true;
-            }
-
-            if (!strcmp(token, "iso-priority")) {
-                int32_t sensitivity_range[2];
-
-                const char* min_iso_str = params.get("min-iso");
-
-                if (min_iso_str)
-                    sensitivity_range[0] = atoi(min_iso_str);
-                else
-                    sensitivity_range[0] = 0;
-
-                const char* max_iso_str = params.get("max-iso");
-                if (max_iso_str)
-                    sensitivity_range[1] = atoi(max_iso_str);
-                else
-                    sensitivity_range[1] = 0;
-
-                metadata->update(ANDROID_SENSOR_INFO_SENSITIVITY_RANGE, sensitivity_range,
-                                 sizeof(sensitivity_range) / sizeof(int32_t));
-
-                if (sensitivity_range[1] > sensitivity_range[0])
-                    supported = true;
-            }
-
-            token = strtok(NULL, ",");
-        }
-
-        if(supported)
-            avail_ae_modes.add(ANDROID_CONTROL_AE_MODE_OFF);
-    }
-
+    avail_ae_modes.add(ANDROID_CONTROL_AE_MODE_OFF);
     if (flash_mode) {
         avail_ae_modes.add(ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH);
         avail_ae_modes.add(ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH);
@@ -2235,13 +2112,8 @@ static int get_camera_info(int camera_id, struct camera_info *info)
         return ret;
 
     camera_device_t *hal1_device;
-    if (hal1_module->common.module_api_version == CAMERA_MODULE_API_VERSION_1_0)
-        ret = hal1_module->common.methods->open(&hal1_module->common, !camera_id ? "0" : "1", (hw_device_t **)&hal1_device);
-    else if(hal1_module->common.module_api_version >= CAMERA_MODULE_API_VERSION_2_3)
-        ret = hal1_module->open_legacy(&hal1_module->common, !camera_id ? "0" : "1", CAMERA_MODULE_API_VERSION_1_0, (hw_device_t **)&hal1_device);
-    else
-        ret = -EINVAL;
-
+    ret = hal1_module->common.methods->open(&hal1_module->common, !camera_id ? "0" : "1",
+            (hw_device_t **)&hal1_device);
     if (ret != 0) {
         ALOGE("Failed to open HAL1 device");
         return ret;
@@ -2291,81 +2163,52 @@ static int set_callbacks(const camera_module_callbacks_t *callbacks)
 {
     adapter_callbacks.hal3_callbacks = callbacks;
 
-    // Legacy module may want callbacks to be set even in HAL1 mode
-    if (hal1_module->common.module_api_version >= CAMERA_MODULE_API_VERSION_2_1 && hal1_module->set_callbacks)
-        hal1_module->set_callbacks(callbacks);
-
     return NO_ERROR;
 }
-
-static int hal1_torch_mode(const char* camera_id, bool enabled);
 
 static int sysfs_torch_mode(const char* camera_id, bool enabled)
 {
     int fd_brightness(-1);
     char buffer[16];
-    bool fallback_to_hal1 = false;
     int ret;
 
     fd_brightness = open(SYSFS_FLASH_PATH_BRIGHTNESS, O_RDWR);
     if (fd_brightness < 0) {
-        ALOGW("%s: failed to open '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
-        ALOGW("%s: trying to open fallback node '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK);
-        fd_brightness = open(SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK, O_RDWR);
-    }
-
-    if (fd_brightness < 0) {
-        ALOGE("%s: failed to open '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS_FALLBACK);
-        fallback_to_hal1 = true;
+        ALOGE("%s: failed to open '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
+        return -EBADF;
     }
 
     if (enabled) {
         int bytes = snprintf(buffer, sizeof(buffer), "1");
         ret = write(fd_brightness, buffer, (size_t)bytes);
         if (ret <= 0) {
-            ALOGE("%s: failed to write to sysfs\n", __FUNCTION__);
-            fallback_to_hal1 = true;
+            ALOGE("%s: failed to write to '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
+            return -EBADFD;
         }
     } else {
         int bytes = snprintf(buffer, sizeof(buffer), "0");
         ret = write(fd_brightness, buffer, (size_t)bytes);
         if (ret <= 0) {
-            ALOGE("%s: failed to write to sysfs\n", __FUNCTION__);
-            fallback_to_hal1 = true;
+            ALOGE("%s: failed to write to '%s'\n", __FUNCTION__, SYSFS_FLASH_PATH_BRIGHTNESS);
+            return -EBADFD;
         }
     }
     close(fd_brightness);
-
-    if (fallback_to_hal1) {
-        ALOGW("%s: sysfs torch mode cannot be used\n", __FUNCTION__);
-        ALOGW("%s: falling back to HAL1 torch mode\n", __FUNCTION__);
-        properties.use_sysfs_torch = false;
-        hal1_torch_mode(camera_id, enabled);
-    }
 
     return NO_ERROR;
 }
 
 static int hal1_torch_mode(const char* camera_id, bool enabled)
 {
-    int ret = -EINVAL;
-
     if (get_legacy_module())
-        return ret;
+        return -EINVAL;
 
     if (!torch_in_use && enabled) {
-
-        if (hal1_module->common.module_api_version == CAMERA_MODULE_API_VERSION_1_0)
-            ret = hal1_module->common.methods->open(&hal1_module->common, camera_id, (hw_device_t **)&torch_hal1_device);
-        else if(hal1_module->common.module_api_version >= CAMERA_MODULE_API_VERSION_2_3)
-            ret = hal1_module->open_legacy(&hal1_module->common, camera_id, CAMERA_MODULE_API_VERSION_1_0, (hw_device_t **)&torch_hal1_device);
-
+        int ret = hal1_module->common.methods->open(&hal1_module->common, camera_id, (hw_device_t **)&torch_hal1_device);
         if (ret != 0) {
             ALOGE("Failed to open HAL1 device");
             return ret;
         }
-
-        HAL1_CALL(torch_hal1_device, set_callbacks, hal1_notify_callback, hal1_data_callback, hal1_data_timestamp_callback, get_memory, torch_hal1_device);
 
         char *settings = HAL1_CALL(torch_hal1_device, get_parameters);
         torch_params.unflatten(String8(settings));
@@ -2424,22 +2267,10 @@ static int init()
         properties.use_sysfs_torch = true;
     }
 
-    property_get("persist.camera.hal3on1.use_preview_window_stub", value, "0");
+    property_get("persist.camera.hal3on1.use_manual_exposure", value, "0");
     if (atoi(value) == 1) {
-        ALOGI("HAL3on1: using preview window stub");
-        properties.use_preview_window_stub = true;
-    }
-
-    property_get("persist.camera.hal3on1.use_hwcomposer", value, "0");
-    if (atoi(value) == 1) {
-        ALOGI("HAL3on1: using hwcomposer for preview buffers");
-        properties.use_hwcomposer = true;
-    }
-
-    property_get("persist.camera.hal3on1.use_msm8916_raw", value, "0");
-    if (atoi(value) == 1) {
-        ALOGI("HAL3on1: will dump raw snapshot on ANDROID_JPEG_QUALITY = 75");
-        properties.use_msm8916_raw = true;
+        ALOGI("HAL3on1: DANGEROUS: manual exposure control will crash Camera HAL after snapshot!");
+        properties.use_manual_exposure = true;
     }
 
     return NO_ERROR;
