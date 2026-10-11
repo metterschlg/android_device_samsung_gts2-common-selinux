@@ -635,3 +635,9 @@ service argos-daemon /vendor/bin/argosd
     class main
     user system
     group system radio
+
+on property:debug.tracing.screen_state=1
+    write /sys/power/autosleep mem
+
+on property:debug.tracing.screen_state=2
+    write /sys/power/autosleep off
